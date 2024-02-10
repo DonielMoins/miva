@@ -46,7 +46,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # User hyperparameters
 d_model = 16
-state_size = 64  # Example state size
+state_size = 1024  # Example state size
 seq_len = 100  # Example sequence length
 batch_size = 128  # Example batch size
 
@@ -351,6 +351,16 @@ class Enwiki8Dataset(Dataset):
         item = {key: val[idx].clone().detach() for key, val in self.data.items()}
         return item
 
+class Enwiki9Dataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data['encoded_inputs'])
+
+    def __getitem__(self, idx):
+        item = {key: val[idx].clone().detach() for key, val in self.data.items()}
+        return item
 
 # Define a function for padding
 def pad_sequences_3d(sequences, max_len=None, pad_value=0):
@@ -501,13 +511,29 @@ def calculate_perplexity(loss):
 def load_enwiki8_dataset():
     print(f"Download and extract enwiki8 data")
     url = "http://mattmahoney.net/dc/enwik8.zip"
-    urllib.request.urlretrieve(url, "enwik8.zip")
+    if not os.path.exists("enwik8.zip"):
+        urllib.request.urlretrieve(url, "enwik8.zip")
+    else:
+        print("enwik8.zip already exists")
+    
 
     with ZipFile("enwik8.zip") as f:
         data = f.read("enwik8").decode("utf-8")
 
     return data
 
+def load_enwiki9_dataset():
+    print(f"Download and extract enwiki9 data")
+    url = "http://mattmahoney.net/dc/enwik9.zip"
+    if not os.path.exists("enwik9.zip"):
+        urllib.request.urlretrieve(url, "enwik9.zip")
+    else:    
+        print("enwik9.zip already exists")
+
+    with ZipFile("enwik9.zip") as f:
+        data = f.read("enwik9").decode("utf-8")
+
+    return data
 # Tokenize and encode the dataset
 def encode_dataset(tokenizer, text_data):
     def batch_encode(tokenizer, text_data, batch_size=1000):
@@ -522,8 +548,8 @@ def encode_dataset(tokenizer, text_data):
         return torch.cat(batched_input_ids)
 
     # Assuming enwiki8_data is a list of sentences
-    input_ids = batch_encode(tokenizer, enwiki8_data)
-
+    # input_ids = batch_encode(tokenizer, enwiki8_data)
+    input_ids = batch_encode(tokenizer, enwiki9_data)
     # vocab_size is the number of unique tokens in the tokenizer's vocabulary
     global vocab_size
     vocab_size = len(tokenizer.vocab)  # Note that for some tokenizers, we might access the vocab directly
@@ -599,12 +625,16 @@ elif USE_TRANSFORMER:
     encoded_inputs_file = 'encoded_inputs_transformer.pt'
 
 if os.path.exists(encoded_inputs_file):
+    # enwiki8_data = load_enwiki8_dataset()
+    enwiki9_data = load_enwiki9_dataset()
+    _, attention_mask, input_ids =  encode_dataset(tokenizer, enwiki9_data)
     print("Loading pre-tokenized data...")
     encoded_inputs = torch.load(encoded_inputs_file)
+
 else:
     print("Tokenizing raw data...")
-    enwiki8_data = load_enwiki8_dataset()
-    encoded_inputs, attention_mask, input_ids = encode_dataset(tokenizer, enwiki8_data)
+    enwiki9_data = load_enwiki9_dataset()
+    encoded_inputs, attention_mask, input_ids = encode_dataset(tokenizer, enwiki9_data)
     torch.save(encoded_inputs, encoded_inputs_file)
     print(f"finished tokenizing data")
 
@@ -623,8 +653,8 @@ train_size = int(total_size * 0.8)
 train_data = {key: val[:train_size] for key, val in data.items()}
 val_data = {key: val[train_size:] for key, val in data.items()}
 
-train_dataset = Enwiki8Dataset(train_data)
-val_dataset = Enwiki8Dataset(val_data)
+train_dataset = Enwiki9Dataset(train_data)
+val_dataset = Enwiki9Dataset(val_data)
 
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -656,15 +686,21 @@ elif USE_TRANSFORMER:
             return prediction_scores
 
     model = NextTokenPredictor(bert_model, vocab_size).to(device)
-
-
-# Define the loss function and optimizer
-criterion = nn.CrossEntropyLoss()
 optimizer = optim.AdamW(model.parameters(), lr=5e-6)
 
-# Training loop
-num_epochs = 25  # Number of epochs to train for
+if os.path.exists("model_chk.tar"):
+    checkpoint = torch.load("model_chk.tar")
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    criterion = checkpoint['loss']
+else:
+    # Define the loss function and optimizer & load the model
+    criterion = nn.CrossEntropyLoss()
 
+# Training loop
+num_epochs = 22  # Number of epochs to train for
+
+#model = nn.DataParallel(model, gpu_ids = [0,1])
 for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
     train_loss = train(model, tokenizer, train_loader, optimizer, criterion, device, max_grad_norm=10.0, DEBUGGING_IS_ON=debugging_is_on)
     val_loss = evaluate(model, val_loader, criterion, device, DEBUGGING_IS_ON=debugging_is_on)
@@ -673,3 +709,20 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
 
     if train_loss < 0 or val_loss < 0:
         debugging_is_on = 1
+    torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': criterion,
+            }, "model_chk.tar")
+torch.save(model, "mamba_model_save.pt")
+
+# Print model's state_dict
+print("Model's state_dict:")
+for param_tensor in model.state_dict():
+    print(param_tensor, "\t", model.state_dict()[param_tensor].size())
+
+# Print optimizer's state_dict
+print("Optimizer's state_dict:")
+for var_name in optimizer.state_dict():
+    print(var_name, "\t", optimizer.state_dict()[var_name])
