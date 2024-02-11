@@ -7,6 +7,7 @@ from torch.nn import functional as F
 from einops import rearrange, repeat
 from tqdm import tqdm
 
+import ray.train.torch
 import math
 import os
 import urllib.request
@@ -686,8 +687,9 @@ elif USE_TRANSFORMER:
             return prediction_scores
 
     model = NextTokenPredictor(bert_model, vocab_size).to(device)
-optimizer = optim.AdamW(model.parameters(), lr=5e-6)
 
+model = ray.train.torch.prepare_model(model)
+optimizer = optim.AdamW(model.parameters(), lr=5e-6)
 if os.path.exists("model_chk.tar"):
     checkpoint = torch.load("model_chk.tar")
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -705,17 +707,27 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
     train_loss = train(model, tokenizer, train_loader, optimizer, criterion, device, max_grad_norm=10.0, DEBUGGING_IS_ON=debugging_is_on)
     val_loss = evaluate(model, val_loader, criterion, device, DEBUGGING_IS_ON=debugging_is_on)
     val_perplexity = calculate_perplexity(val_loss)
+    metrics = { "epoch": epoch+1, "train_loss": train_loss, "val_loss": val_loss, "val_perplexity": val_perplexity }
     print(f'Epoch: {epoch+1}, Training Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}, Validation Perplexity: {val_perplexity:.4f}')
 
     if train_loss < 0 or val_loss < 0:
         debugging_is_on = 1
-    torch.save({
+    with tempfile.TemporaryDirectory() as temp_checkpoint_dir:
+        torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': criterion,
-            }, "model_chk.tar")
+            }, os.path.join(temp_checkpoint_dir, "model.pt"))
+        ray.train.report(
+                metrics,
+                checkpoint=ray.train.Checkpoint.from_directory(temp_checkpoint_dir),
+            )
+        if ray.train.get_context().get_world_rank() == 0:
+            print(metrics)
+
 torch.save(model, "mamba_model_save.pt")
+
 
 # Print model's state_dict
 print("Model's state_dict:")
