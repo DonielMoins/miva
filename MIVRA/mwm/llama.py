@@ -32,6 +32,24 @@ from lwm.ring_attention import blockwise_ffn, ring_flash_attention_tpu, \
     ring_attention_standard, ring_attention
 
 
+# Move torch functions in S6 to jax.numpy
+from torch.nn import functional as F
+from einops import rearrange, repeat
+
+
+USE_MAMBA = 1
+USE_TRANSFORMER = ~USE_MAMBA
+DIFFERENT_H_STATES_RECURRENT_UPDATE_MECHANISM = 0
+
+# Mamba hyperparameters
+# User hyperparameters
+d_model = 16
+state_size = 1024  # Example state size
+seq_len = 100  # Example sequence length
+batch_size = 128  # Example batch size
+
+
+
 LLAMA_STANDARD_CONFIGS = {
     '200m': {
         'vocab_size': 32000,
@@ -712,6 +730,164 @@ class FlaxLLaMAAttention(nn.Module):
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
         return outputs
 
+# TODO: Convert nn calls to flax equivalent
+class S6(nn.Module):
+    def __init__(self, seq_len, d_model, state_size, device):
+        super(S6, self).__init__()
+
+        self.fc1 = nn.Linear(d_model, d_model, device=device)
+        self.fc2 = nn.Linear(d_model, state_size, device=device)
+        self.fc3 = nn.Linear(d_model, state_size, device=device)
+
+        self.seq_len = seq_len
+        self.d_model = d_model
+        self.state_size = state_size
+
+        #self.A = nn.Parameter(torch.ones(d_model, state_size, device=device))
+        #self.A = nn.Parameter(F.normalize(torch.ones(d_model, state_size, device=device), p=2, dim=-1))
+        #nn.init.xavier_uniform_(self.A)
+
+        # S4D real initialization, MAMBA removed imaginary portions for S4D-Inv and S4D-Lin initialization schemes
+        # described in [On the Parameterization and Initialization of Diagonal State Space Models](https://arxiv.org/abs/2206.11893)
+        # https://github.com/state-spaces/mamba/blob/fb7b5310fa865dbd62aa059b1e26f2b431363e2a/mamba_ssm/modules/mamba_simple.py#L103-L108C23
+        A = repeat(
+            nn.arange(1, state_size + 1, dtype=nn.float32, device=device),
+            "n -> d n",
+            d=d_model,
+        ).contiguous()
+
+        A_log = nn.log(A)  # For numerical stability during training process
+        self.A_log = nn.Parameter(A_log)
+        self.A_log._no_weight_decay = True
+
+        self.A = nn.zeros_like(self.A_log)
+        self.B = nn.zeros(batch_size, self.seq_len, self.state_size, device=device)
+        self.C = nn.zeros(batch_size, self.seq_len, self.state_size, device=device)
+
+        #self.delta = torch.zeros(batch_size, self.seq_len, self.d_model, device=device)
+        # Initialize delta parameter using a uniform distribution and apply the inverse softplus
+        uniform_distribution = nn.distributions.Uniform(0.001, 0.1)
+        # Sample from the uniform distribution and then apply the inverse softplus
+        self.delta = self.inverse_softplus(uniform_distribution.sample((batch_size, self.seq_len, self.d_model)))
+
+        self.dA = nn.zeros(batch_size, self.seq_len, self.d_model, self.state_size, device=device)
+        self.dB = nn.zeros(batch_size, self.seq_len, self.d_model, self.state_size, device=device)
+
+        # h should have dimensions [batch_size, seq_len, d_model, state_size]
+        self.h = nn.zeros(batch_size, self.seq_len, self.d_model, self.state_size, device=device)
+        self.y = nn.zeros(batch_size, self.seq_len, self.d_model, device=device)
+
+
+    def inverse_softplus(self, y):
+        return nn.log(nn.exp(y) - 1)
+
+    def discretization(self):
+        # discretization function is defined based on the MAMBA paper's description using ZOH on page 28
+        # in Section C : Mechanics on Selective SSMs
+        # See also "Zero-order hold discretization" maths proof inside https://studywolf.wordpress.com/tag/zero-order-hold/
+        """
+        Here is an explanation of the mathematical rationale for the formulation of Δt used in Mamba:
+        The key idea is that Δt controls the discretization rate of the continuous SSM dynamics. By making Δt input-dependent, it introduces selectivity into the discrete transition matrices.
+        Specifically, in Mamba they parameterize Δt as:
+        Δt = τΔ(Parameter + sΔ(xt))
+        Where:
+        - Parameter is a learned scalar parameter that controls the baseline discretization rate
+        - sΔ(xt) is a projection that makes Δt input-dependent by computing a value based on xt
+        - τΔ(x) = softplus(x) transforms the result to be positive through the softplus nonlinearity
+        The rationale for this formulation is:
+        - Parameter provides a reasonable default discretization rate
+        - sΔ(xt) injects input-dependence through the projection
+        - softplus ensures Δt is positive as required to be a valid timestep
+        - The projection sΔ allows the model to learn to modulate Δt based on the input xt
+        - This modulation creates selectivity in how rapidly or slowly the states update
+        So in summary, the learned input-dependent projection allows Δt, and thus the discrete dynamics, to become selective. The softplus and scalar parameter provide useful inductive biases on top of this flexibility.
+        The end result is discrete transition matrices that are selective on the input, enabling powerful sequence modeling capabilities.
+        Credit: Claude2 AI chatbot
+        """
+
+        # For numerical stability during training process
+        self.A = -nn.exp(self.A_log.float())  # (d_model, state_size)
+
+        #print(f"self.A.shape = {self.A.shape}")
+        #print(f"self.B.shape = {self.B.shape}")
+        #print(f"self.delta.shape = {self.delta.shape}")
+
+        # inverse() only supports square matrix
+        #dB = torch.matmul(torch.inverse(A * delta), torch.matmul(dA - torch.eye(A.shape[0]), B))
+        self.dB = nn.einsum("bld,bln->bldn", self.delta, self.B)
+
+        # https://github.com/state-spaces/mamba/blob/0131c1e94a46fc9f70bcfc9d57962963bb2f0b9e/mamba_ssm/modules/mamba_simple.py#L240
+        #dA = torch.matrix_exp(A * delta)  # matrix_exp() only supports square matrix
+        self.dA = nn.exp(nn.einsum("bld,dn->bldn", self.delta, self.A))
+        #print(f"self.dA.shape = {self.dA.shape}")
+        #print(f"self.dA.requires_grad = {self.dA.requires_grad}")
+
+        return self.dA, self.dB
+
+    def forward(self, x):
+        # Refer to Algorithm 2 in the MAMBA paper
+        self.B = self.fc2(x)
+        self.C = self.fc3(x)
+
+        # "a large ∆ resets the state `h` and focuses on the current input `x`,
+        # while a small ∆ persists the state and ignores the current input."
+        self.delta = F.softplus(self.fc1(x))
+
+        # Uses ZOH as in MAMBA, Hungry Hippo still uses bilinear transform for discretization
+        self.discretization()
+
+        if DIFFERENT_H_STATES_RECURRENT_UPDATE_MECHANISM:  # this will trigger in-place runtime error if without using `h_new`
+            #print(f"self.dA = {self.dA}, self.dB = {self.dB}")
+            #print(f"self.dA.shape = {self.dA.shape}")
+            #print(f"self.dB.shape = {self.dB.shape}")
+            #print(f"x.shape = {x.shape}")
+            #print(f"self.h.shape = {self.h.shape}")
+            #print(f"self.C.shape = {self.C.shape}")
+
+            global current_batch_size
+            current_batch_size = x.shape[0]
+
+            if self.h.shape[0] != current_batch_size:
+                #print("Adjusting h_new for the different batch size of input data `x`")
+                different_batch_size = True
+
+                # Resize self.h to match the current batch size
+                h_new =  nn.einsum('bldn,bldn->bldn', self.dA, self.h[:current_batch_size, ...]) + rearrange(x, "b l d -> b l d 1") * self.dB
+
+            else:
+                different_batch_size = False
+                h_new =  nn.einsum('bldn,bldn->bldn', self.dA, self.h) + rearrange(x, "b l d -> b l d 1") * self.dB
+
+            # y needs to have a shape of [batch_size, seq_len, d_model]
+            self.y = nn.einsum('bln,bldn->bld', self.C, h_new)
+
+            # Update self.h with the detached state of h_new
+            # Only do this if retaining gradients for self.h is not necessary for backprop
+            # Otherwise, store h_new in a temporary list and update self.h after the loop
+            global temp_buffer
+            temp_buffer = h_new.detach().clone() if not self.h.requires_grad else h_new.clone()
+            #print(f"temp_buffer.shape = {temp_buffer.shape}")
+
+            #print(f"self.y = {self.y}")
+            #print(f"self.dA.requires_grad = {self.dA.requires_grad}")
+            #print(f"self.dB.requires_grad = {self.dB.requires_grad}")
+            #print(f"self.C.requires_grad = {self.C.requires_grad}")
+            #print(f"self.h.requires_grad = {self.h.requires_grad}")
+            #print(f"self.y.requires_grad = {self.y.requires_grad}")
+
+            return self.y
+
+        else:  # this will not trigger in-place runtime error
+            # h should have dimensions [batch_size, seq_len, d_model, state_size]
+            h = nn.zeros(x.size(0), self.seq_len, self.d_model, self.state_size, device=x.device)
+            y = nn.zeros_like(x)
+
+            h =  nn.einsum('bldn,bldn->bldn', self.dA, h) + rearrange(x, "b l d -> b l d 1") * self.dB
+
+            # y needs to have a shape of [batch_size, seq_len, d_model]
+            y = nn.einsum('bln,bldn->bld', self.C, h)
+
+            return y
 
 class FlaxLLaMAMLP(nn.Module):
     config: LLaMAConfig
@@ -721,7 +897,6 @@ class FlaxLLaMAMLP(nn.Module):
 
     def setup(self) -> None:
         config = self.config
-
         self.w1 = nn.Dense(
             config.intermediate_size,
             dtype=self.dtype,
@@ -752,6 +927,82 @@ class FlaxLLaMAMLP(nn.Module):
         x = self.w2(nn.silu(self.w1(x)) * self.w3(x))
         x = self.dropout(x, deterministic=deterministic)
         return x
+
+class MambaBlock(nn.Module):
+    def __init__(self, seq_len, d_model, state_size, device):
+        super(MambaBlock, self).__init__()
+
+        self.inp_proj = nn.Linear(d_model, 2*d_model, device=device)
+        self.out_proj = nn.Linear(2*d_model, d_model, device=device)
+
+        # For residual skip connection
+        self.D = nn.Linear(d_model, 2*d_model, device=device)
+
+        # Set _no_weight_decay attribute on bias
+        self.out_proj.bias._no_weight_decay = True
+
+        # Initialize bias to a small constant value
+        nn.init.constant_(self.out_proj.bias, 1.0)
+
+        self.S6 = S6(seq_len, 2*d_model, state_size, device)
+
+        # Add 1D convolution with kernel size 3
+        self.conv = nn.Conv1d(seq_len, seq_len, kernel_size=3, padding=1, device=device)
+
+        # rmsnorm
+        self.norm = RMSNorm(d_model, device=device)
+
+
+    def forward(self, x, attention_mask=None):
+
+        if attention_mask is not None:
+            # Apply the attention mask
+            x = x * attention_mask.unsqueeze(-1)
+
+        """
+        x_proj.shape = torch.Size([batch_size, seq_len, 2*d_model])
+        x_conv.shape = torch.Size([batch_size, seq_len, 2*d_model])
+        x_conv_act.shape = torch.Size([batch_size, seq_len, 2*d_model])
+        """
+        # Refer to Figure 3 in the MAMBA paper
+
+        x = self.norm(x)
+
+        x_proj = self.inp_proj(x)
+        #print(f"x_proj.shape = {x_proj.shape}")
+
+        # Add 1D convolution with kernel size 3
+        x_conv = self.conv(x_proj)
+
+        # Create a triangular mask of the same shape as the input sequence
+        mask = nn.tril(nn.ones(seq_len, 2*d_model, device=device))
+
+        # Add batch dimension with unsqueeze(0) -> (1, seq_len, seq_len)
+        # Repeat batch dim to match x_conv batches with .repeat()
+        current_batch_size = x.shape[0]
+        mask = mask.repeat(current_batch_size, 1, 1)
+
+        # Apply causal mask to zero out the masked regions
+        x_conv = x_conv * mask
+        #print(f"x_conv.shape = {x_conv.shape}")
+
+        x_conv_act = F.silu(x_conv)  # Swish activation can be implemented as x * sigmoid(x)
+        #print(f"x_conv_act.shape = {x_conv_act.shape}")
+
+        x_ssm = self.S6(x_conv_act)
+        #print(f"x_ssm.shape = {x_ssm.shape}")
+
+        # residual skip connection with nonlinearity introduced by multiplication
+        x_residual = F.silu(self.D(x))
+        #print(f"x_residual.shape = {x_residual.shape}")
+        x_combined = x_ssm * x_residual
+        #print(f"x_combined.shape = {x_combined.shape}")
+
+        x_out = self.out_proj(x_combined)
+        #print(f"x_out.shape = {x_out.shape}")
+
+        return x_out
+
 
 
 class FlaxLLaMABlock(nn.Module):
@@ -800,6 +1051,7 @@ class FlaxLLaMABlock(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
+        
 
     def __call__(
         self,
@@ -1132,6 +1384,12 @@ class FlaxLLaMAModule(nn.Module):
         )
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
         self.h = FlaxLLaMABlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
+        
+        self.m1 = MambaBlock(self.config.max_sequence_length, self.config.hidden_size, self.config.scan_mlp_chunk_size, "cuda")
+        self.m2 = MambaBlock(self.config.max_sequence_length, self.config.hidden_size, self.config.scan_mlp_chunk_size, "cuda")
+        self.m3 = MambaBlock(self.config.max_sequence_length, self.config.hidden_size, self.config.scan_mlp_chunk_size, "cuda")
+        self.final_proj = nn.Linear(self.config.hidden_size, self.config.hidden_size, device=device)
+
         self.ln_f = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype, param_dtype=self.param_dtype)
 
     def __call__(
@@ -1163,6 +1421,14 @@ class FlaxLLaMAModule(nn.Module):
         )
 
         hidden_states = outputs[0]
+        
+        # Mamba blocks
+        hidden_states = self.m1(hidden_states)
+        hidden_states = self.m2(hidden_states)
+        hidden_states = self.m3(hidden_states)
+        
+        hidden_states = self.final_proj(hidden_states)
+        
         hidden_states = self.ln_f(hidden_states)
 
         if output_hidden_states:
@@ -1191,7 +1457,7 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]]=None
 
     def setup(self):
-        self.transformer = FlaxLLaMAModule(self.config, dtype=self.dtype)
+        self.transmamba = FlaxLLaMAModule(self.config, dtype=self.dtype)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
@@ -1223,7 +1489,7 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
                 (batch_size, seq_length)
             )
-        outputs = self.transformer(
+        outputs = self.transmamba(
             input_ids,
             attention_mask,
             segment_ids,
@@ -1238,7 +1504,7 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.transformer.variables["params"]["wte"]["embedding"].T
+            shared_kernel = self.transmamba.variables["params"]["wte"]["embedding"].T
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)
