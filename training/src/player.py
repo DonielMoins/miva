@@ -8,7 +8,7 @@ from torch.nn import functional as F
 from einops import rearrange, repeat
 from tqdm import tqdm
 from transformers.modeling_utils import PreTrainedModel
-import lightning.pytorch as pl
+# import lightning.pytorch as pl
 import ray.train.torch
 import math
 import os
@@ -555,7 +555,7 @@ def encode_dataset(tokenizer, text_data):
     input_ids = batch_encode(tokenizer, enwiki9_data)
     # vocab_size is the number of unique tokens in the tokenizer's vocabulary
     global vocab_size
-    vocab_size = len(tokenizer.vocab)  # Note that for some tokenizers, we might access the vocab directly
+    vocab_size = tokenizer.vocab_size  # Note that for some tokenizers, we might access the vocab directly
     print(f"vocab_size = {vocab_size}")
 
     # Create an embedding layer
@@ -615,10 +615,13 @@ def encode_dataset(tokenizer, text_data):
 
 # Load a pretrained tokenizer
 tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-#tokenizer = AutoTokenizer.from_pretrained('EleutherAI/gpt-neox-20b')
+# tokenizer = AutoTokenizer.from_pretrained('EleutherAI/gpt-neox-20b')
 
+print(f"tokenizer.pad_token = {tokenizer.pad_token}")
 # Use an existing special token as the padding token.
-#tokenizer.pad_token = tokenizer.eos_token
+# tokenizer.pad_token = tokenizer.eos_token
+print(f"tokenizer.pad_token = {tokenizer.pad_token}")
+
 
 
 # Assuming encoded_inputs is a preprocessed tensor of shape [num_samples, seq_len, d_model]
@@ -627,70 +630,47 @@ if USE_MAMBA:
 elif USE_TRANSFORMER:
     encoded_inputs_file = 'encoded_inputs_transformer.pt'
 
-if os.path.exists(encoded_inputs_file):
-    # enwiki8_data = load_enwiki8_dataset()
-    enwiki9_data = load_enwiki9_dataset()
-    _, attention_mask, input_ids =  encode_dataset(tokenizer, enwiki9_data)
-    print("Loading pre-tokenized data...")
-    encoded_inputs = torch.load(encoded_inputs_file)
+# if os.path.exists(encoded_inputs_file):
+#     # enwiki8_data = load_enwiki8_dataset()
+#     enwiki9_data = load_enwiki9_dataset()
+#     _, attention_mask, input_ids =  encode_dataset(tokenizer, enwiki9_data)
+#     print("Loading pre-tokenized data...")
+#     encoded_inputs = torch.load(encoded_inputs_file)
 
-else:
-    print("Tokenizing raw data...")
-    enwiki9_data = load_enwiki9_dataset()
-    encoded_inputs, attention_mask, input_ids = encode_dataset(tokenizer, enwiki9_data)
-    torch.save(encoded_inputs, encoded_inputs_file)
-    print(f"finished tokenizing data")
+# else:
+#     print("Tokenizing raw data...")
+#     enwiki9_data = load_enwiki9_dataset()
+#     encoded_inputs, attention_mask, input_ids = encode_dataset(tokenizer, enwiki9_data)
+#     torch.save(encoded_inputs, encoded_inputs_file)
+#     print(f"finished tokenizing data")
 
 
 # Combine into a single dictionary
-data = {
-    'input_ids': input_ids,
-    'encoded_inputs': encoded_inputs,
-    'attention_mask': attention_mask
-}
+# data = {
+#     'input_ids': input_ids,
+#     'encoded_inputs': encoded_inputs,
+#     'attention_mask': attention_mask
+# }
 
 # Split the data into train and validation sets
-total_size = len(data['encoded_inputs'])
-train_size = int(total_size * 0.8)
+# total_size = len(data['encoded_inputs'])
+# train_size = int(total_size * 0.8)
 
-train_data = {key: val[:train_size] for key, val in data.items()}
-val_data = {key: val[train_size:] for key, val in data.items()}
+# train_data = {key: val[:train_size] for key, val in data.items()}
+# val_data = {key: val[train_size:] for key, val in data.items()}
 
-train_dataset = Enwiki9Dataset(train_data)
-val_dataset = Enwiki9Dataset(val_data)
+# train_dataset = Enwiki9Dataset(train_data)
+# val_dataset = Enwiki9Dataset(val_data)
 
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+# train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+# val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
 
 # Initialize the model
-if USE_MAMBA:
-    model = Mamba(seq_len, d_model, state_size, vocab_size, device).to(device)
+model = Mamba(seq_len, d_model, state_size, tokenizer.vocab_size, device).to(device)
 
-elif USE_TRANSFORMER:
-    from transformers import AutoModel
-
-    # Create TinyBert model instance
-    bert_model = AutoModel.from_pretrained("prajjwal1/bert-tiny").to(device)
-
-    print(f"bert_model.config.hidden_size = {bert_model.config.hidden_size}")
-
-    class NextTokenPredictor(nn.Module):
-        def __init__(self, bert_model, vocab_size):
-            super(NextTokenPredictor, self).__init__()
-            self.bert = bert_model
-            self.predictor = nn.Linear(bert_model.config.hidden_size, vocab_size)
-
-        def forward(self, input_ids, attention_mask):
-            outputs = self.bert(input_ids, attention_mask=attention_mask)
-            sequence_output = outputs.last_hidden_state
-            prediction_scores = self.predictor(sequence_output)
-            return prediction_scores
-
-    model = NextTokenPredictor(bert_model, vocab_size).to(device)
-
-model = ray.train.torch.prepare_model(model)
+# model = ray.train.torch.prepare_model(model)
 optimizer = optim.AdamW(model.parameters(), lr=5e-6)
 if os.path.exists("model_chk.tar"):
     checkpoint = torch.load("model_chk.tar")
@@ -700,7 +680,22 @@ if os.path.exists("model_chk.tar"):
 else:
     # Define the loss function and optimizer & load the model
     criterion = nn.CrossEntropyLoss()
-
+# model.eval()
+input_ids = tokenizer.encode("Hello, my dog is cute", add_special_tokens=True, truncation=True,
+                               padding='max_length', max_length=15,
+                               return_tensors='pt')
+# Batch size 1
+# Convert input)ids to tensor
+input_ids = torch.tensor(input_ids).clone().detach().to(device)
+input_ids = pad_sequences_3d(input_ids, pad_value=tokenizer.pad_token_id)
+x = model(input_ids, torch.zeros(1, 100).to(device))
+# tokenizer.decode()
+for i in x:
+    print(tokenizer.decode())
+    # print(tokenizer.decode(input_ids[0][i]))
+    # print("")
+out = tokenizer.decode()
+print(out)
 # Training loop
 num_epochs = 22  # Number of epochs to train for
 
@@ -741,3 +736,4 @@ for param_tensor in model.state_dict():
 print("Optimizer's state_dict:")
 for var_name in optimizer.state_dict():
     print(var_name, "\t", optimizer.state_dict()[var_name])
+

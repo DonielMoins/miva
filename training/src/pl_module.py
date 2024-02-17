@@ -4,7 +4,7 @@ import sqlite3
 from typing import Optional, List
 
 import numpy as np
-import sentencepiece as spm
+from transformers import AutoTokenizer
 import torch
 import zstandard
 from pytorch_lightning import LightningDataModule
@@ -104,8 +104,8 @@ class Pile(LightningDataModule):
     ):
         super(Pile, self).__init__()
         self.tokenizer_path = tokenizer_path
-        self.tokenizer = spm.SentencePieceProcessor()
-        self.tokenizer.load(tokenizer_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        # self.tokenizer.load(tokenizer_path)
         self.vocab_size = self.tokenizer.vocab_size()
 
         self.max_seq_len = max_seq_len
@@ -131,7 +131,7 @@ class Pile(LightningDataModule):
                 ]
             )
             self.train_dataset = PileRandomIODataset(
-                train_paths, self.max_seq_len, self.tokenizer.pad_id()
+                train_paths, self.max_seq_len, self.tokenizer.pad_token_id
             )
 
             val_paths = sorted(
@@ -142,7 +142,7 @@ class Pile(LightningDataModule):
                 ]
             )
             self.val_dataset = PileRandomIODataset(
-                val_paths, self.max_seq_len, self.tokenizer.pad_id()
+                val_paths, self.max_seq_len, self.tokenizer.pad_token_id
             )
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:

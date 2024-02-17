@@ -6,8 +6,8 @@ import os
 import sqlite3
 from multiprocessing import Pool
 from typing import List, Optional
+from transformers import AutoTokenizer
 
-import sentencepiece as spm
 import zstandard
 
 from utils import get_rolling_token_windows
@@ -45,8 +45,8 @@ def prepare_data_worker(
         "CREATE TABLE rows (id INTEGER PRIMARY KEY, dataset TEXT, seq BLOB, pred_start INTEGER)"
     )
 
-    tokenizer = spm.SentencePieceProcessor()
-    tokenizer.load(tokenizer_path)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    # tokenizer.load(tokenizer_path)
 
     with open(read_path, "rb") as fh:
         dctx = zstandard.ZstdDecompressor()
@@ -61,12 +61,12 @@ def prepare_data_worker(
                 continue
 
             text = obj["text"].strip()
-            tokens = tokenizer.EncodeAsIds(text)
+            tokens = tokenizer.encode(text)
             if len(tokens) <= 5:
                 continue
 
             for input_tokens, pred_tokens in get_rolling_token_windows(
-                tokens, tokenizer.PieceToId("[eod]"), max_seq_len, context_len
+                tokens, tokenizer.encode("[eod]"), max_seq_len, context_len
             ):
                 seq = input_tokens + pred_tokens[-1:]
                 pred_start = len(seq) - len(pred_tokens)
