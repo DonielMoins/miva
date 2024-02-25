@@ -18,7 +18,7 @@ from transformers.utils import add_start_docstrings, add_start_docstrings_to_mod
 from transformers import GenerationConfig
 
 from tux import load_pickle, open_file
-from lwm.llama import LLaMAConfig, LLAMA_STANDARD_CONFIGS, FlaxLLaMABlockCollection, RMSNorm
+from mwm.llama import LLaMAConfig, LLAMA_STANDARD_CONFIGS, FlaxLLaMABlockCollection, RMSNorm
 
 
 VIDEO_LLAMA_STANDARD_CONFIGS = LLAMA_STANDARD_CONFIGS

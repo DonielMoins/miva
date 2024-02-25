@@ -15,8 +15,8 @@ from tux import (
     match_partition_rules, make_shard_and_gather_fns,
     with_sharding_constraint, tree_apply, open_file
 )
-from lwm.vision_llama import VideoLLaMAConfig, FlaxVideoLLaMAForCausalLM
-from lwm.vqgan import VQGAN
+from mwm.vision_llama import VideoLLaMAConfig, FlaxVideoLLaMAForCausalLM
+from mwm.vqgan import VQGAN
 
 
 FLAGS, FLAGS_DEF = define_flags_with_default(
