@@ -10,12 +10,12 @@ export llama_tokenizer_path=""
 export dataset_path=""
 export output_dir=""
 
-export project_id='lwm'
+export project_id='mwm'
 export experiment_note=''
 export experiment_id='example-text-train'
 
 # mesh_dim: dp, fsdp, tp, sp
-python3 -u -m lwm.train \
+python3 -u -m mwm.train \
     --modality='text' \
     --mesh_dim='!1,-1,2,2' \
     --dtype='fp32' \
